@@ -1,0 +1,1282 @@
+# Board: ESP32-S3 DevKitC-1 (Espressif)
+# Definition: definitions/boards/esp32-s3-devkitc-1/manifest.yaml
+
+esphome:
+  name: neato
+  friendly_name: Neato
+  on_boot:
+    priority: -100
+    then:
+      - lambda: |-
+          if (id(xbox_mac) != 0) id(manette).set_address(id(xbox_mac));
+          id(puissance_aspiration).publish_state(id(vac_pct));
+      # Sécurité : jamais de mode test laissé actif après un redémarrage de l'ESP.
+      - uart.write:
+          id: neato_uart
+          data: "TestMode Off\r\n"
+      - delay: 20s
+      - script.execute: set_robot_time
+      - delay: 2s
+      - script.execute: read_version
+
+
+esp32:
+  variant: esp32s3
+  flash_size: 8MB
+  framework:
+    type: esp-idf
+
+logger:
+  hardware_uart: UART0
+
+api:
+  actions:
+    - action: abonner_manette
+      variables:
+        poignee: int
+      then:
+        - script.execute:
+            id: abonner_manette
+            poignee: !lambda return poignee;
+    - action: commande
+      variables:
+        texte: string
+      then:
+        - lambda: |-
+            std::string c = texte + "\r\n";
+            id(neato_uart).write_str(c.c_str());
+            if (texte.find("TestMode") != std::string::npos) id(odo_init) = false;
+  encryption:
+    key: !secret neato_api_key
+
+ota:
+  - platform: esphome
+    encryption:
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: Neato Fallback Hotspot
+    password: !secret neato_fallback_password
+
+captive_portal:
+
+# Port série interne du robot (connecteur P7 de la carte mère, 3,3 V, 115200 8N1).
+# Sens vérifié sur un Botvac D85 : TX de l'ESP sur GPIO18, RX de l'ESP sur GPIO17, masse au milieu de P7.
+# L'ESP est alimenté par la batterie du robot (convertisseur 5 V après l'interrupteur).
+debug:
+  update_interval: 60s
+
+uart:
+  - id: neato_uart
+    tx_pin: GPIO18
+    rx_pin: GPIO17
+    baud_rate: 115200
+    rx_buffer_size: 8192
+
+# Appairage « Just Works » avec mémorisation : la manette se reconnecte ensuite d'elle-même.
+esp32_ble:
+  io_capability: none
+  auth_req_mode: sc_bond
+
+esp32_ble_tracker:
+  scan_parameters:
+    active: true
+  # Manette Xbox (firmware 5.x, Bluetooth basse consommation) : la première vue est adoptée.
+  on_ble_advertise:
+    - then:
+        - lambda: |-
+            std::string name(x.get_name().c_str());
+            uint64_t a = x.address_uint64();
+            // Une manette Xbox : son nom (scan actif seulement) ou une annonce Microsoft avec le service HID.
+            bool xbox = name.find("Xbox") != std::string::npos;
+            if (!xbox) {
+              bool hid = false, microsoft = false;
+              for (auto &u : x.get_service_uuids())
+                if (u == esphome::ble_device_base::ESPBTUUID::from_uint16(0x1812)) hid = true;
+              for (auto &m : x.get_manufacturer_datas())
+                if (m.uuid == esphome::ble_device_base::ESPBTUUID::from_uint16(0x0006)) microsoft = true;
+              xbox = hid && microsoft;
+            }
+            if (!xbox) return;
+            char mac[18];
+            snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X",
+                     (int) ((a >> 40) & 0xFF), (int) ((a >> 32) & 0xFF), (int) ((a >> 24) & 0xFF),
+                     (int) ((a >> 16) & 0xFF), (int) ((a >> 8) & 0xFF), (int) (a & 0xFF));
+            static uint64_t seen = 0;
+            if (a != seen) {
+              seen = a;
+              id(manette_vue).publish_state(name + " " + mac);
+            }
+            if (id(xbox_mac) == 0) {
+              id(xbox_mac) = a;
+              id(manette).set_address(a);
+              ESP_LOGI("manette", "Manette adoptée : %s", mac);
+            }
+
+bluetooth_proxy:
+  active: true
+  connection_slots: 2
+
+# La manette : adresse 0 tant qu'aucune n'est adoptée (fixée au démarrage ou au premier passage).
+ble_client:
+  - id: manette
+    mac_address: "00:00:00:00:00:00"
+    on_connect:
+      then:
+        - lambda: |-
+            id(manette_reliee).publish_state(true);
+            esp_err_t err = esp_ble_set_encryption(id(manette)->get_remote_bda(), ESP_BLE_SEC_ENCRYPT);
+            ESP_LOGI("manette", "Chiffrement demandé (%d)", err);
+        # Une fois la liaison chiffrée, réabonnement aux rapports : l'abonnement fait par ESPHome à la
+        # découverte des services a été refusé tant que la liaison n'était pas chiffrée. Le descripteur
+        # d'abonnement (0x2902) suit la valeur du rapport ; la demande « sans MITM » attend le chiffrement.
+        # L'appairage prend 3 à 4 s : abonnement à 6 s, puis encore à 10 s par sécurité.
+        - delay: 6s
+        - script.execute:
+            id: abonner_manette
+            poignee: 0
+        - delay: 4s
+        - script.execute:
+            id: abonner_manette
+            poignee: 0
+    on_disconnect:
+      then:
+        - lambda: |-
+            id(manette_reliee).publish_state(false);
+            id(pad_lx) = 0;
+            id(pad_ly) = 0;
+            id(pad_lt) = 0;
+            id(pad_rt) = 0;
+            id(pad_btn) = 0;
+        - script.execute: stop_drive
+
+# Heure de Home Assistant, recopiée chaque nuit dans l'horloge du robot.
+time:
+  - platform: homeassistant
+    id: ha_time
+    on_time:
+      - hours: 4
+        minutes: 0
+        seconds: 0
+        then:
+          - script.execute: set_robot_time
+
+globals:
+  - id: rx
+    type: std::string
+  # Commande en attente de réponse : 1 GetCharger, 2 GetErr, 3 GetMotors, 4 GetLDSScan,
+  # 5 GetWarranty, 6 SetSystemMode (sonde du mode test), 7 GetVersion, 8 GetDigitalSensors
+  - id: pending
+    type: int
+    initial_value: "0"
+  - id: err_seen
+    type: bool
+    initial_value: "false"
+  - id: lds_valid
+    type: int
+    initial_value: "0"
+  - id: last_reply
+    type: uint32_t
+    initial_value: "0"
+  # Le robot vient de redémarrer (ligne « <Fast Memory> ») : tout relire.
+  - id: robot_booted
+    type: bool
+    initial_value: "false"
+  - id: soft_version
+    type: std::string
+  # Dernières vitesses lues par GetMotors (tr/min ; roues signées).
+  - id: rpm_vac
+    type: int
+    initial_value: "0"
+  - id: rpm_brush
+    type: int
+    initial_value: "0"
+  - id: rpm_lw
+    type: int
+    initial_value: "0"
+  - id: rpm_rw
+    type: int
+    initial_value: "0"
+  - id: load_lw
+    type: int
+    initial_value: "0"
+  - id: load_rw
+    type: int
+    initial_value: "0"
+  - id: cur_brush
+    type: int
+    initial_value: "0"
+  - id: cur_side
+    type: int
+    initial_value: "0"
+  - id: cur_vac
+    type: int
+    initial_value: "0"
+  # Compteurs des roues (mm, GetMotors : LeftWheel_PositionInMM / RightWheel_PositionInMM).
+  - id: pos_l
+    type: int
+    initial_value: "0"
+  - id: pos_r
+    type: int
+    initial_value: "0"
+  # Odométrie : compteurs précédents, trajet en cours (mm), cap (rad, + = vers la gauche),
+  # position (mm, x devant au départ, y à gauche), distance totale (mm, gardée).
+  - id: odo_init
+    type: bool
+    initial_value: "false"
+  - id: last_pl
+    type: int
+    initial_value: "0"
+  - id: last_pr
+    type: int
+    initial_value: "0"
+  - id: trip_mm
+    type: float
+    initial_value: "0"
+  - id: heading
+    type: float
+    initial_value: "0"
+  - id: odo_x
+    type: float
+    initial_value: "0"
+  - id: odo_y
+    type: float
+    initial_value: "0"
+  - id: total_mm
+    type: float
+    restore_value: true
+    initial_value: "0"
+  # Capteurs numériques : 1 pare-chocs côté gauche, 2 avant gauche, 4 côté droit, 8 avant droit,
+  # 16 laser gauche, 32 laser droit, 64 roue gauche sortie, 128 roue droite sortie.
+  - id: digital
+    type: int
+    initial_value: "0"
+  - id: tick
+    type: int
+    initial_value: "0"
+  - id: last_direct
+    type: std::string
+  # Manette : adresse adoptée (gardée), sticks centrés sur 0 (±32768), gâchettes 0-1023,
+  # boutons (octets 13, 14 et 15 du rapport).
+  - id: xbox_mac
+    type: uint64_t
+    restore_value: true
+    initial_value: "0"
+  - id: pad_lx
+    type: int
+    initial_value: "0"
+  - id: pad_ly
+    type: int
+    initial_value: "0"
+  - id: pad_lt
+    type: int
+    initial_value: "0"
+  - id: pad_rt
+    type: int
+    initial_value: "0"
+  - id: pad_btn
+    type: uint32_t
+    initial_value: "0"
+  # Pilotage : demandé (entrée en mode test en cours) puis actif.
+  - id: drive_req
+    type: bool
+    initial_value: "false"
+  - id: driving
+    type: bool
+    initial_value: "false"
+  - id: stop_sent
+    type: bool
+    initial_value: "true"
+  - id: horn
+    type: bool
+    initial_value: "false"
+  - id: last_active
+    type: uint32_t
+    initial_value: "0"
+  - id: drive_n
+    type: int
+    initial_value: "0"
+  - id: brush_on
+    type: bool
+    initial_value: "false"
+  - id: vac_on
+    type: bool
+    initial_value: "false"
+  # Puissance d'aspiration du pilotage (%), réglée à la croix : haut +20, bas -20.
+  - id: vac_pct
+    type: int
+    restore_value: true
+    initial_value: "80"
+  - id: aux_cmd
+    type: std::string
+  # Laser : 360 distances en cm (0 = pas de mesure), puis 720 caractères (2 par degré, base 64).
+  - id: lds_cm
+    type: std::vector<uint16_t>
+  - id: lidar_str
+    type: std::string
+
+script:
+  - id: set_robot_time
+    then:
+      - lambda: |-
+          auto now = id(ha_time).now();
+          if (!now.is_valid()) return;
+          // ESPHome compte les jours de 1 (dimanche) à 7 ; le Neato de 0 (dimanche) à 6.
+          char buf[64];
+          snprintf(buf, sizeof(buf), "SetTime Day %d Hour %d Min %d Sec %d\r\n",
+                   now.day_of_week - 1, now.hour, now.minute, now.second);
+          id(neato_uart).write_str(buf);
+  - id: send_lds_scan
+    then:
+      - lambda: |-
+          id(pending) = 4;
+          id(lds_valid) = 0;
+      - uart.write:
+          id: neato_uart
+          data: "GetLDSScan\r\n"
+  - id: read_version
+    then:
+      - lambda: id(pending) = 7;
+      - uart.write:
+          id: neato_uart
+          data: "GetVersion\r\n"
+  # Relevé chaque seconde : moteurs et capteurs ; erreurs toutes les 5 s ; batterie, mode test,
+  # valeurs d'historique et version si elle manque toutes les 30 s ; laser chaque seconde pendant un nettoyage.
+  - id: refresh_all
+    mode: single
+    then:
+      - lambda: |-
+          id(tick)++;
+          id(pending) = 3;
+      - uart.write:
+          id: neato_uart
+          data: "GetMotors\r\n"
+      - delay: 150ms
+      - lambda: id(pending) = 8;
+      - uart.write:
+          id: neato_uart
+          data: "GetDigitalSensors\r\n"
+      - delay: 150ms
+      - if:
+          condition:
+            # Un tour de laser par seconde pendant un nettoyage (avant : un toutes les 3 s).
+            lambda: return id(en_nettoyage).state;
+          then:
+            - script.execute: send_lds_scan
+            # Le scan fait environ 360 lignes : attendre la fin réelle de la réponse.
+            - wait_until:
+                condition:
+                  lambda: return id(pending) == 0;
+                timeout: 1500ms
+      - if:
+          condition:
+            lambda: return id(tick) % 5 == 0;
+          then:
+            - lambda: |-
+                id(pending) = 2;
+                id(err_seen) = false;
+            - uart.write:
+                id: neato_uart
+                data: "GetErr\r\n"
+            - delay: 250ms
+      - if:
+          condition:
+            lambda: return id(tick) % 30 == 1;
+          then:
+            - lambda: id(pending) = 1;
+            - uart.write:
+                id: neato_uart
+                data: "GetCharger\r\n"
+            - delay: 300ms
+            # Sans option, SetSystemMode répond « No options specified » en mode test et
+            # « TestMode must be on… » sinon : il ne change rien, il sert de sonde.
+            - lambda: id(pending) = 6;
+            - uart.write:
+                id: neato_uart
+                data: "SetSystemMode\r\n"
+            - delay: 250ms
+            - script.execute: publish_history
+            - if:
+                condition:
+                  lambda: return id(soft_version).empty();
+                then:
+                  - script.execute: read_version
+                  - delay: 800ms
+      - if:
+          condition:
+            lambda: return id(tick) % 3600 == 15;
+          then:
+            - lambda: id(pending) = 5;
+            - uart.write:
+                id: neato_uart
+                data: "GetWarranty\r\n"
+            - delay: 400ms
+  # Valeurs gardées dans l'historique de Home Assistant : une toutes les 30 s.
+  - id: publish_history
+    then:
+      - script.execute: odo_publish
+      - lambda: |-
+          id(vitesse_aspiration).publish_state(id(rpm_vac));
+          id(vitesse_brosse).publish_state(id(rpm_brush));
+          id(vitesse_roue_gauche).publish_state(id(rpm_lw));
+          id(vitesse_roue_droite).publish_state(id(rpm_rw));
+          id(charge_roue_gauche).publish_state(id(load_lw));
+          id(charge_roue_droite).publish_state(id(load_rw));
+          id(courant_brosse).publish_state(id(cur_brush));
+          id(courant_brosse_laterale).publish_state(id(cur_side));
+          id(courant_aspiration).publish_state(id(cur_vac));
+  # Valeurs en direct pour un tableau de bord (capteur exclu de l'historique).
+  - id: publish_direct
+    then:
+      - lambda: |-
+          float deg = id(heading) * 180.0f / M_PI;
+          while (deg > 180.0f) deg -= 360.0f;
+          while (deg < -180.0f) deg += 360.0f;
+          char buf[256];
+          snprintf(buf, sizeof(buf),
+                   "{\"a\":%d,\"b\":%d,\"g\":%d,\"d\":%d,\"cg\":%d,\"cd\":%d,\"ib\":%d,\"il\":%d,\"ia\":%d,\"p\":%d,\"t\":%d,\"h\":%d,\"x\":%d,\"y\":%d}",
+                   id(rpm_vac), id(rpm_brush), id(rpm_lw), id(rpm_rw), id(load_lw), id(load_rw),
+                   id(cur_brush), id(cur_side), id(cur_vac), id(digital),
+                   (int) (id(trip_mm) / 10), (int) lroundf(deg), (int) (id(odo_x) / 10), (int) (id(odo_y) / 10));
+          std::string d(buf);
+          if (d != id(last_direct)) {
+            id(last_direct) = d;
+            id(direct).publish_state(d);
+          }
+  - id: after_robot_boot
+    mode: single
+    then:
+      - delay: 5s
+      - script.execute: read_version
+      - delay: 2s
+      - script.execute: refresh_all
+      - delay: 12s
+      - script.execute: set_robot_time
+  # Odométrie : les compteurs des roues (mm) cumulent d'un ordre à l'autre et repartent de zéro à chaque
+  # changement de mode test. Écart entre les roues : 242 mm (190 mm par roue en sens opposé = 90°).
+  - id: odo_update
+    then:
+      - lambda: |-
+          int pl = id(pos_l), pr = id(pos_r);
+          if (!id(odo_init) || (pl == 0 && pr == 0)) {
+            id(last_pl) = pl;
+            id(last_pr) = pr;
+            id(odo_init) = true;
+            return;
+          }
+          int dl = pl - id(last_pl), dr = pr - id(last_pr);
+          id(last_pl) = pl;
+          id(last_pr) = pr;
+          if (dl == 0 && dr == 0) return;
+          if (abs(dl) > 1500 || abs(dr) > 1500) return;  // saut : compteurs remis à zéro par le robot
+          const float WHEELBASE = 242.0f;
+          float ds = (dl + dr) / 2.0f;
+          float dth = (dr - dl) / WHEELBASE;
+          float mid = id(heading) + dth / 2.0f;
+          id(odo_x) += ds * cosf(mid);
+          id(odo_y) += ds * sinf(mid);
+          id(heading) += dth;
+          id(trip_mm) += fabsf(ds);
+          id(total_mm) += fabsf(ds);
+  - id: odo_reset
+    then:
+      - lambda: |-
+          id(trip_mm) = 0;
+          id(heading) = 0;
+          id(odo_x) = 0;
+          id(odo_y) = 0;
+          id(odo_init) = false;
+      - script.execute: odo_publish
+  - id: odo_publish
+    then:
+      - lambda: |-
+          float deg = id(heading) * 180.0f / M_PI;
+          while (deg > 180.0f) deg -= 360.0f;
+          while (deg < -180.0f) deg += 360.0f;
+          id(distance_trajet).publish_state(id(trip_mm) / 1000.0f);
+          id(cap).publish_state(deg);
+          id(distance_totale).publish_state(id(total_mm) / 1000.0f);
+  - id: lidar_publish
+    mode: single
+    then:
+      - lambda: |-
+          static const char *B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+          std::string out;
+          out.reserve(720);
+          for (int i = 0; i < 360; i++) {
+            int v = i < (int) id(lds_cm).size() ? id(lds_cm)[i] : 0;
+            out += B64[(v >> 6) & 63];
+            out += B64[v & 63];
+          }
+          id(lidar_str) = out;
+          // Un scan sur dix recopié dans le journal (en deux moitiés : lignes limitées à 512 octets).
+          static int n = 0;
+          if (n++ % 10 == 0) {
+            ESP_LOGD("lidar", "A %s", out.substr(0, 360).c_str());
+            ESP_LOGD("lidar", "B %s", out.substr(360).c_str());
+          }
+      - homeassistant.event:
+          event: esphome.neato_lidar
+          data:
+            d: !lambda return id(lidar_str);
+            # Odométrie au moment du tour (dernier GetMotors, moins d'une seconde avant).
+            x: !lambda return to_string((int) lroundf(id(odo_x)));
+            y: !lambda return to_string((int) lroundf(id(odo_y)));
+            h: !lambda return to_string((int) lroundf(id(heading) * 1800.0f / M_PI));
+            l: !lambda return to_string(id(pos_l));
+            r: !lambda return to_string(id(pos_r));
+            t: !lambda return to_string((int) lroundf(id(trip_mm)));
+            n: !lambda return to_string(id(lds_valid));
+            m: !lambda 'return to_string(id(en_nettoyage).state ? 1 : id(pilotage).state ? 2 : 0);'
+  - id: abonner_manette
+    mode: queued
+    parameters:
+      poignee: int
+    then:
+      - lambda: |-
+          if (!id(manette).connected()) return;
+          uint16_t cccd = poignee > 0 ? poignee : id(manette_rapport)->handle + 1;
+          uint8_t on[2] = {0x01, 0x00};
+          esp_err_t err = esp_ble_gattc_write_char_descr(id(manette)->get_gattc_if(), id(manette)->get_conn_id(), cccd,
+                                                        sizeof(on), on, ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_NO_MITM);
+          ESP_LOGI("manette", "Abonnement aux rapports, poignée %u (%d)", cccd, err);
+  # Pilotage à la manette. A : mode test puis pilotage ; B, manette perdue ou 5 min sans geste : arrêt.
+  # Pendant le pilotage : X brosses, RB aspiration, Y klaxon.
+  - id: start_drive
+    mode: single
+    then:
+      - if:
+          condition:
+            lambda: return !id(driving) && !id(drive_req);
+          then:
+            - lambda: id(drive_req) = true;
+            - script.wait: refresh_all
+            - delay: 300ms
+            - uart.write:
+                id: neato_uart
+                data: "TestMode On\r\n"
+            # SetMotor et SetLDSRotation ne sont acceptés qu'environ 2 s après l'entrée en mode test.
+            - delay: 2500ms
+            - uart.write:
+                id: neato_uart
+                data: "SetLDSRotation On\r\n"
+            - delay: 100ms
+            - script.execute: odo_reset
+            - lambda: |-
+                id(stop_sent) = true;
+                id(last_active) = millis();
+                id(driving) = true;
+                id(pilotage).publish_state(true);
+                id(mode_test).publish_state(true);
+  - id: stop_drive
+    mode: single
+    then:
+      - script.stop: start_drive
+      - if:
+          condition:
+            lambda: return id(driving) || id(drive_req);
+          then:
+            - lambda: id(driving) = false;
+            - script.wait: drive_tick
+            - uart.write:
+                id: neato_uart
+                data: "SetMotor LWheelDist 1 RWheelDist 1 Speed 1\r\n"
+            - lambda: |-
+                id(aux_cmd).clear();
+                if (id(brush_on) || id(vac_on)) {
+                  id(neato_uart).write_str("SetMotor Brush RPM 0\r\nSetMotor SideBrushOff\r\nSetMotor VacuumOff\r\n");
+                  id(brush_on) = false;
+                  id(vac_on) = false;
+                }
+            - delay: 300ms
+            - uart.write:
+                id: neato_uart
+                data: "SetLDSRotation Off\r\n"
+            - delay: 200ms
+            - uart.write:
+                id: neato_uart
+                data: "TestMode Off\r\n"
+            - delay: 300ms
+            - script.execute: odo_publish
+            - lambda: |-
+                id(drive_req) = false;
+                id(pilotage).publish_state(false);
+                id(mode_test).publish_state(false);
+  # Un pas de pilotage (environ 5 par seconde) : ordre aux roues pour 0,6 s de route, renouvelé
+  # tant que le stick est poussé (un nouvel ordre remplace le précédent), puis pare-chocs relus.
+  - id: drive_tick
+    mode: single
+    then:
+      - lambda: |-
+          const float DZ = 0.15f;
+          auto axis = [&](int v) {
+            float f = v / 32768.0f;
+            if (fabsf(f) < DZ) return 0.0f;
+            return (f > 0 ? f - DZ : f + DZ) / (1.0f - DZ);
+          };
+          float fwd = -axis(id(pad_ly));
+          float turn = axis(id(pad_lx));
+          // Gâchette droite : turbo ; gauche : au pas.
+          float vmax = id(pad_rt) > 300 ? 300.0f : (id(pad_lt) > 300 ? 100.0f : 200.0f);
+          float l = fwd + 0.6f * turn, r = fwd - 0.6f * turn;
+          float m = fmaxf(fabsf(l), fabsf(r));
+          if (m > 1.0f) { l /= m; r /= m; }
+          int bits = id(digital);
+          if (bits & 192) { l = 0; r = 0; }                    // robot soulevé
+          if ((bits & 15) && l + r > 0.01f) { l = 0; r = 0; }  // contact : pas de marche avant
+          int vl = (int) (l * vmax), vr = (int) (r * vmax);
+          if (vl == 0 && vr == 0) {
+            if (!id(stop_sent)) {
+              // Un ordre minuscule remplace le mouvement en cours : arrêt net.
+              id(neato_uart).write_str("SetMotor LWheelDist 1 RWheelDist 1 Speed 1\r\n");
+              id(stop_sent) = true;
+            }
+          } else {
+            int sp = std::max(abs(vl), abs(vr));
+            if (sp < 30) sp = 30;
+            char buf[80];
+            snprintf(buf, sizeof(buf), "SetMotor LWheelDist %d RWheelDist %d Speed %d\r\n",
+                     vl * 6 / 10, vr * 6 / 10, sp);
+            id(neato_uart).write_str(buf);
+            id(stop_sent) = false;
+            id(last_active) = millis();
+          }
+          if (id(horn)) {
+            id(horn) = false;
+            id(neato_uart).write_str("PlaySound SoundID 15\r\n");
+          }
+          if (!id(aux_cmd).empty()) {
+            id(neato_uart).write_str(id(aux_cmd).c_str());
+            id(aux_cmd).clear();
+            id(last_active) = millis();
+          }
+          if (millis() - id(last_active) > 300000) id(stop_drive).execute();
+      - delay: 50ms
+      - lambda: id(pending) = 8;
+      - uart.write:
+          id: neato_uart
+          data: "GetDigitalSensors\r\n"
+      - delay: 130ms
+      - if:
+          condition:
+            lambda: return ++id(drive_n) % 5 == 0;
+          then:
+            - lambda: id(pending) = 3;
+            - uart.write:
+                id: neato_uart
+                data: "GetMotors\r\n"
+            - delay: 150ms
+      - if:
+          condition:
+            lambda: return id(drive_n) % 5 == 2;
+          then:
+            - script.execute: send_lds_scan
+            # Le scan fait environ 360 lignes : attendre la fin réelle de la réponse.
+            - wait_until:
+                condition:
+                  lambda: return id(pending) == 0;
+                timeout: 1500ms
+  # Boutons physiques simulés : appui sur Start, puis « soft » pour valider le menu.
+  - id: press_start_then_soft
+    mode: single
+    then:
+      - uart.write:
+          id: neato_uart
+          data: "SetButton start\r\n"
+      - delay: 1250ms
+      - uart.write:
+          id: neato_uart
+          data: "SetButton soft\r\n"
+
+number:
+  - platform: template
+    id: spot_largeur
+    name: Zone largeur
+    unit_of_measurement: cm
+    min_value: 100
+    max_value: 500
+    step: 10
+    initial_value: 200
+    restore_value: true
+    optimistic: true
+    mode: box
+  - platform: template
+    id: spot_hauteur
+    name: Zone hauteur
+    unit_of_measurement: cm
+    min_value: 100
+    max_value: 500
+    step: 10
+    initial_value: 200
+    restore_value: true
+    optimistic: true
+    mode: box
+
+sensor:
+  - platform: template
+    id: charge_roue_gauche
+    name: Charge roue gauche
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    entity_category: diagnostic
+  - platform: template
+    id: charge_roue_droite
+    name: Charge roue droite
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    entity_category: diagnostic
+  - platform: template
+    id: vitesse_aspiration
+    name: Vitesse aspiration
+    unit_of_measurement: tr/min
+    accuracy_decimals: 0
+    entity_category: diagnostic
+  - platform: template
+    id: vitesse_brosse
+    name: Vitesse brosse
+    unit_of_measurement: tr/min
+    accuracy_decimals: 0
+    entity_category: diagnostic
+  # Courants des moteurs (GetMotors) : pour un tableau de bord.
+  - platform: template
+    id: courant_brosse
+    name: Courant brosse
+    unit_of_measurement: mA
+    accuracy_decimals: 0
+    entity_category: diagnostic
+  - platform: template
+    id: courant_brosse_laterale
+    name: Courant brosse latérale
+    unit_of_measurement: mA
+    accuracy_decimals: 0
+    entity_category: diagnostic
+  - platform: template
+    id: courant_aspiration
+    name: Courant aspiration
+    unit_of_measurement: mA
+    accuracy_decimals: 0
+    entity_category: diagnostic
+  - platform: template
+    id: vitesse_roue_gauche
+    name: Vitesse roue gauche
+    unit_of_measurement: tr/min
+    accuracy_decimals: 0
+    entity_category: diagnostic
+  - platform: template
+    id: vitesse_roue_droite
+    name: Vitesse roue droite
+    unit_of_measurement: tr/min
+    accuracy_decimals: 0
+    entity_category: diagnostic
+  - platform: template
+    id: batterie
+    name: Batterie
+    unit_of_measurement: "%"
+    device_class: battery
+    accuracy_decimals: 0
+  - platform: template
+    id: tension
+    name: Tension batterie
+    unit_of_measurement: V
+    device_class: voltage
+    accuracy_decimals: 2
+  - platform: template
+    id: temp_batterie
+    name: Température batterie
+    unit_of_measurement: °C
+    device_class: temperature
+    accuracy_decimals: 0
+  - platform: template
+    id: heures_nettoyage
+    name: Heures de nettoyage
+    unit_of_measurement: h
+    accuracy_decimals: 0
+    state_class: total_increasing
+  - platform: template
+    id: laser_points
+    name: Laser points valides
+    unit_of_measurement: points
+    accuracy_decimals: 0
+  - platform: template
+    id: laser_vitesse
+    name: Laser vitesse
+    unit_of_measurement: tr/s
+    accuracy_decimals: 1
+  - platform: wifi_signal
+    name: Signal Wi-Fi
+    update_interval: 60s
+  # Suivi de l'alimentation de l'ESP : temps écoulé depuis son dernier démarrage.
+  - platform: uptime
+    name: Allumé depuis
+    update_interval: 30s
+  - platform: template
+    id: distance_trajet
+    name: Distance du trajet
+    unit_of_measurement: m
+    icon: mdi:map-marker-distance
+    accuracy_decimals: 2
+  - platform: template
+    id: cap
+    name: Cap
+    unit_of_measurement: "°"
+    icon: mdi:compass-outline
+    accuracy_decimals: 0
+  - platform: template
+    id: distance_totale
+    name: Distance totale
+    unit_of_measurement: m
+    icon: mdi:counter
+    accuracy_decimals: 0
+    state_class: total_increasing
+  - platform: template
+    id: puissance_aspiration
+    name: Puissance d'aspiration
+    unit_of_measurement: "%"
+    icon: mdi:fan
+    accuracy_decimals: 0
+    lambda: return id(vac_pct);
+    update_interval: never
+  # Rapport Xbox (16 octets) : sticks gauche X/Y et droit X/Y sur 16 bits, gâchettes G/D sur 10 bits,
+  # croix, boutons (A 0x01, B 0x02, X 0x08, Y 0x10, LB 0x40, RB 0x80), View/Menu/Xbox, Share.
+  - platform: ble_client
+    type: characteristic
+    ble_client_id: manette
+    id: manette_rapport
+    internal: true
+    service_uuid: "1812"
+    characteristic_uuid: "2a4d"
+    notify: true
+    update_interval: never
+    lambda: |-
+      if (x.size() < 15) return (float) x.size();
+      auto u16 = [&](int i) { return (int) (x[i] | (x[i + 1] << 8)); };
+      id(pad_lx) = u16(0) - 32768;
+      id(pad_ly) = u16(2) - 32768;
+      id(pad_lt) = u16(8);
+      id(pad_rt) = u16(10);
+      uint32_t btn = x[13] | (x[14] << 8) | (x.size() > 15 ? (x[15] << 16) : 0);
+      uint32_t pressed = btn & ~id(pad_btn);
+      id(pad_btn) = btn;
+      if (pressed & 0x01) id(start_drive).execute();
+      if (pressed & 0x02) id(stop_drive).execute();
+      if ((pressed & 0x10) && id(driving)) id(horn) = true;
+      if ((pressed & 0x08) && id(driving)) {
+        id(brush_on) = !id(brush_on);
+        id(aux_cmd) += id(brush_on) ? "SetMotor Brush RPM 800\r\nSetMotor SideBrushEnable\r\nSetMotor SideBrushOn\r\n" : "SetMotor Brush RPM 0\r\nSetMotor SideBrushOff\r\n";
+      }
+      if ((pressed & 0x80) && id(driving)) {
+        id(vac_on) = !id(vac_on);
+        if (id(vac_on)) {
+          char vb[48];
+          snprintf(vb, sizeof(vb), "SetMotor VacuumOn VacuumSpeed %d\r\n", id(vac_pct));
+          id(aux_cmd) += vb;
+        } else {
+          id(aux_cmd) += "SetMotor VacuumOff\r\n";
+        }
+      }
+      // Croix (octet 12) : 1 haut, 5 bas ; à l'appui seulement.
+      static int last_hat = 0;
+      int hat = x[12];
+      if (hat != last_hat && id(driving) && (hat == 1 || hat == 5)) {
+        int pct = id(vac_pct) + (hat == 1 ? 20 : -20);
+        pct = pct > 100 ? 100 : (pct < 20 ? 20 : pct);
+        if (pct != id(vac_pct)) {
+          id(vac_pct) = pct;
+          id(puissance_aspiration).publish_state(pct);
+          ESP_LOGI("manette", "Aspiration à %d %%", pct);
+          if (id(vac_on)) {
+            char vb[48];
+            snprintf(vb, sizeof(vb), "SetMotor VacuumOn VacuumSpeed %d\r\n", pct);
+            id(aux_cmd) += vb;
+          }
+        }
+      }
+      last_hat = hat;
+      // Octets bruts pour vérifier la disposition : à chaque changement de bouton, sinon 1 fois/s.
+      static uint32_t last_pub = 0;
+      static uint32_t last_btn = 0xFFFFFFFF;
+      if (btn != last_btn || millis() - last_pub > 1000) {
+        last_pub = millis();
+        last_btn = btn;
+        char hex[64];
+        int n = 0;
+        for (size_t i = 0; i < x.size() && i < 20; i++) n += snprintf(hex + n, sizeof(hex) - n, "%02X ", x[i]);
+        id(manette_brut).publish_state(std::string(hex, n > 0 ? n - 1 : 0));
+      }
+      return (float) x.size();
+
+binary_sensor:
+  - platform: template
+    id: en_charge
+    name: En charge
+    device_class: battery_charging
+  - platform: template
+    id: sur_base
+    name: Sur la base
+    device_class: plug
+  - platform: template
+    id: batterie_defaut
+    name: Défaut batterie
+    device_class: problem
+  - platform: template
+    id: batterie_surchauffe
+    name: Surchauffe batterie
+    device_class: heat
+  - platform: template
+    id: jauge_fiable
+    name: Jauge fiable
+  - platform: template
+    id: batterie_reserve
+    name: Batterie sur la réserve
+    device_class: battery
+  - platform: template
+    id: batterie_vide
+    name: Batterie vide
+    device_class: battery
+  - platform: template
+    id: en_nettoyage
+    name: En nettoyage
+    device_class: running
+  - platform: template
+    id: bac_en_place
+    name: Bac en place
+  # Pendant un nettoyage, une roue force (plus de 70 % de charge) sans tourner.
+  - platform: template
+    id: coince
+    name: Robot coincé
+    device_class: problem
+  - platform: template
+    id: mode_test
+    name: Mode test
+    device_class: problem
+  - platform: template
+    id: manette_reliee
+    name: Manette reliée
+    device_class: connectivity
+  - platform: template
+    id: pilotage
+    name: Pilotage manette
+    device_class: running
+  # Le robot a répondu dans les 90 dernières secondes.
+  - platform: template
+    id: relie
+    name: Robot relié
+    device_class: connectivity
+    lambda: |-
+      return id(last_reply) != 0 && millis() - id(last_reply) < 90000;
+
+text_sensor:
+  # Cause du dernier démarrage de l'ESP (coupure de courant, chute de tension, plantage, mise à jour).
+  - platform: debug
+    reset_reason:
+      name: Cause du dernier démarrage
+  # « nettoie » si l'aspiration ou la brosse tourne, « roule » si seules les roues tournent.
+  - platform: template
+    id: activite
+    name: Activité
+  - platform: template
+    id: erreur
+    name: Erreur
+  - platform: template
+    id: modele
+    name: Modèle
+    entity_category: diagnostic
+  - platform: template
+    id: numero_serie
+    name: Numéro de série
+    entity_category: diagnostic
+  - platform: template
+    id: logiciel
+    name: Logiciel du robot
+    entity_category: diagnostic
+  - platform: template
+    id: manette_vue
+    name: Manette vue
+    icon: mdi:microsoft-xbox-controller
+    entity_category: diagnostic
+  - platform: template
+    id: manette_brut
+    name: Manette rapport brut
+    icon: mdi:microsoft-xbox-controller
+    entity_category: diagnostic
+  # Moteurs et capteurs à la seconde, en JSON, pour le tableau de bord (exclu de l'historique).
+  - platform: template
+    id: direct
+    name: Direct
+    icon: mdi:speedometer
+    entity_category: diagnostic
+
+button:
+  - platform: template
+    name: Nettoyer
+    icon: mdi:robot-vacuum
+    on_press:
+      - uart.write:
+          id: neato_uart
+          data: "Clean Stop\r\n"
+      - delay: 2s
+      - uart.write:
+          id: neato_uart
+          data: "Clean House\r\n"
+  # Nettoyage localisé sur la zone réglée (100 à 500 cm). Le robot le refuse en mode AutoCycle.
+  - platform: template
+    name: Nettoyer autour
+    icon: mdi:selection-ellipse
+    on_press:
+      - lambda: |-
+          char buf[64];
+          snprintf(buf, sizeof(buf), "Clean Spot Width %d Height %d\r\n",
+                   (int) id(spot_largeur).state, (int) id(spot_hauteur).state);
+          id(neato_uart).write_str(buf);
+  - platform: template
+    name: Pause
+    icon: mdi:pause
+    on_press:
+      - uart.write:
+          id: neato_uart
+          data: "SetButton start\r\n"
+  - platform: template
+    name: Reprendre
+    icon: mdi:play
+    on_press:
+      - uart.write:
+          id: neato_uart
+          data: "SetButton start\r\n"
+  # Arrêt comme avec les boutons du robot (plus doux que « Clean Stop »).
+  - platform: template
+    name: Arrêter
+    icon: mdi:stop
+    on_press:
+      - script.execute: press_start_then_soft
+  - platform: template
+    name: Retour au départ
+    icon: mdi:home-import-outline
+    on_press:
+      - uart.write:
+          id: neato_uart
+          data: "SetButton down\r\n"
+      - delay: 1250ms
+      - uart.write:
+          id: neato_uart
+          data: "SetButton soft\r\n"
+  - platform: template
+    name: Faire sonner
+    icon: mdi:bell-ring
+    on_press:
+      - uart.write:
+          id: neato_uart
+          data: "PlaySound SoundID 15\r\n"
+  - platform: template
+    name: Mettre à l'heure
+    icon: mdi:clock-check-outline
+    on_press:
+      - script.execute: set_robot_time
+  - platform: template
+    name: Sortir du mode test
+    icon: mdi:shield-check
+    on_press:
+      - uart.write:
+          id: neato_uart
+          data: "TestMode Off\r\n"
+  # Sans mode test, le robot ne fait tourner son laser que pendant un nettoyage : à l'arrêt,
+  # le scan risque de revenir vide.
+  - platform: template
+    name: Scanner au laser
+    icon: mdi:radar
+    on_press:
+      - script.execute: send_lds_scan
+  - platform: template
+    name: Arrêter le pilotage
+    icon: mdi:controller-off
+    on_press:
+      - script.execute: stop_drive
+  # Pour jumeler une autre manette : oublier celle-ci, puis mettre la nouvelle en appairage.
+  - platform: template
+    name: Oublier la manette
+    icon: mdi:link-variant-off
+    entity_category: config
+    on_press:
+      - script.execute: stop_drive
+      - ble_client.remove_bond:
+          id: manette
+      - ble_client.disconnect:
+          id: manette
+      - lambda: |-
+          id(xbox_mac) = 0;
+          id(manette).set_address(0);
+          id(manette_vue).publish_state("");
+  - platform: restart
+    name: Redémarrer l'ESP
+
+interval:
+  # Réponses du robot : lignes en Latin-1, terminées par 0x1A en fin de commande.
+  - interval: 20ms
+    then:
+      - lambda: |-
+          uint8_t c;
+          // Une réponse peut finir par 0x1A sans retour à la ligne après sa dernière ligne
+          // (ex. « SideBrush_mA,54 » en fin de GetMotors) : on traite d'abord cette ligne,
+          // puis on rejoue le 0x1A pour clore la réponse.
+          bool replay = false;
+          while (replay || (id(neato_uart).available() > 0 && id(neato_uart).read_byte(&c))) {
+            if (replay) {
+              c = 0x1A;
+              replay = false;
+            } else {
+              id(last_reply) = millis();
+            }
+            if (c == 0x1A && !id(rx).empty()) {
+              c = '\n';
+              replay = true;
+            }
+            if (c == 0x1A) {
+              if (id(pending) == 2 && !id(err_seen)) id(erreur).publish_state("Aucune");
+              if (id(pending) == 4) {
+                id(laser_points).publish_state(id(lds_valid));
+                if (id(lds_valid) > 0) id(lidar_publish).execute();
+              }
+              if (id(pending) == 7 && !id(soft_version).empty()) id(logiciel).publish_state(id(soft_version));
+              if (id(pending) == 3) {
+                bool working = id(rpm_vac) > 0 || id(rpm_brush) > 0;
+                bool rolling = id(rpm_lw) != 0 || id(rpm_rw) != 0;
+                bool forcing = (id(load_lw) > 70 && id(rpm_lw) == 0) || (id(load_rw) > 70 && id(rpm_rw) == 0);
+                if (!id(coince).has_state() || id(coince).state != (working && forcing)) id(coince).publish_state(working && forcing);
+                // Départ de la base : le trajet repart de zéro au moment où les roues démarrent, robot encore
+                // sur la base. L'origine est alors la base, et le cap zéro la direction de sortie.
+                // (Avant, la remise à zéro attendait l'aspiration : le robot avait déjà roulé et tourné.)
+                static bool was_rolling = false;
+                static uint32_t depart_ms = 0;
+                if (rolling && !was_rolling && id(sur_base).has_state() && id(sur_base).state) {
+                  id(trip_mm) = 0;
+                  id(heading) = 0;
+                  id(odo_x) = 0;
+                  id(odo_y) = 0;
+                  depart_ms = millis();
+                }
+                was_rolling = rolling;
+                if (!id(en_nettoyage).has_state() || id(en_nettoyage).state != working) {
+                  // Nettoyage lancé ailleurs que sur la base : le trajet repart de l'endroit où il commence.
+                  bool depuis_base = depart_ms != 0 && millis() - depart_ms < 120000;
+                  if (working && id(en_nettoyage).has_state() && !depuis_base) id(odo_reset).execute();
+                  id(en_nettoyage).publish_state(working);
+                }
+                std::string act = working ? "nettoie" : rolling ? "roule" : "à l'arrêt";
+                if (id(activite).state != act) id(activite).publish_state(act);
+              }
+              if (id(pending) == 3) id(odo_update).execute();
+              if (id(pending) == 3 || id(pending) == 8) id(publish_direct).execute();
+              id(pending) = 0;
+              id(rx).clear();
+              continue;
+            }
+            if (c == '\r') continue;
+            if (c != '\n') {
+              if (c < 0x80) {
+                id(rx).push_back((char) c);
+              } else {
+                id(rx).push_back((char) (0xC0 | (c >> 6)));
+                id(rx).push_back((char) (0x80 | (c & 0x3F)));
+              }
+              continue;
+            }
+            std::string line = id(rx);
+            id(rx).clear();
+            if (line.find("<Fast Memory>") != std::string::npos) {
+              id(robot_booted) = true;
+              continue;
+            }
+            auto value = [&](const char *key, std::string &out) {
+              std::string k = std::string(key) + ",";
+              if (line.rfind(k, 0) != 0) return false;
+              out = line.substr(k.size());
+              return true;
+            };
+            // « BotVacBasic,905-0285, » → « BotVacBasic 905-0285 »
+            auto fields = [](std::string s) {
+              while (!s.empty() && (s.back() == ',' || s.back() == ' ')) s.pop_back();
+              for (auto &ch : s) if (ch == ',') ch = ' ';
+              return s;
+            };
+            std::string v;
+            if (id(pending) == 4) {
+              // Lignes « angle,distance mm,intensité,erreur » puis « ROTATION_SPEED,5.12 ».
+              if (value("ROTATION_SPEED", v)) {
+                id(laser_vitesse).publish_state(atof(v.c_str()));
+              } else if (!line.empty() && isdigit((unsigned char) line[0])) {
+                int angle, dist, intensity, err;
+                if (sscanf(line.c_str(), "%d,%d,%d,%x", &angle, &dist, &intensity, &err) == 4) {
+                  if (id(lds_cm).size() != 360) id(lds_cm).assign(360, 0);
+                  bool ok = err == 0 && dist > 0;
+                  if (ok) id(lds_valid)++;
+                  if (angle >= 0 && angle < 360) id(lds_cm)[angle] = ok ? std::min(dist / 10, 4095) : 0;
+                }
+              }
+            } else if (id(pending) == 6) {
+              if (line.find("No options specified") != std::string::npos) id(mode_test).publish_state(true);
+              else if (line.find("TestMode must be on") != std::string::npos) id(mode_test).publish_state(false);
+            } else if (id(pending) == 7) {
+              if (value("Model", v)) id(modele).publish_state(fields(v));
+              else if (value("Serial Number", v)) id(numero_serie).publish_state(fields(v));
+              else if (value("Software", v)) {
+                // « 1,2,1 » → « 1.2.1 »
+                std::string s = fields(v);
+                for (auto &ch : s) if (ch == ' ') ch = '.';
+                id(soft_version) = s;
+              }
+            }
+            else if (value("FuelPercent", v)) id(batterie).publish_state(atof(v.c_str()));
+            else if (value("VBattV", v)) id(tension).publish_state(atof(v.c_str()));
+            else if (value("BattTempCAvg", v)) id(temp_batterie).publish_state(atof(v.c_str()));
+            else if (value("BatteryFailure", v)) id(batterie_defaut).publish_state(v == "1");
+            else if (value("BatteryOverTemp", v)) id(batterie_surchauffe).publish_state(v == "1");
+            else if (value("ConfidentOnFuel", v)) id(jauge_fiable).publish_state(v == "1");
+            else if (value("OnReservedFuel", v)) id(batterie_reserve).publish_state(v == "1");
+            else if (value("EmptyFuel", v)) id(batterie_vide).publish_state(v == "1");
+            else if (value("ChargingActive", v)) id(en_charge).publish_state(v == "1");
+            else if (value("ExtPwrPresent", v)) id(sur_base).publish_state(v == "1");
+            else if (value("Brush_RPM", v)) id(rpm_brush) = atoi(v.c_str());
+            else if (value("Brush_mA", v)) id(cur_brush) = atoi(v.c_str());
+            else if (value("SideBrush_mA", v)) id(cur_side) = atoi(v.c_str());
+            else if (value("Vacuum_mA", v)) id(cur_vac) = atoi(v.c_str());
+            else if (value("Vacuum_RPM", v)) id(rpm_vac) = atoi(v.c_str());
+            else if (value("LeftWheel_RPM", v)) id(rpm_lw) = atoi(v.c_str());
+            else if (value("RightWheel_RPM", v)) id(rpm_rw) = atoi(v.c_str());
+            else if (value("LeftWheel_Load%", v)) id(load_lw) = atoi(v.c_str());
+            else if (value("RightWheel_Load%", v)) id(load_rw) = atoi(v.c_str());
+            else if (value("LeftWheel_PositionInMM", v)) id(pos_l) = atoi(v.c_str());
+            else if (value("RightWheel_PositionInMM", v)) id(pos_r) = atoi(v.c_str());
+            else if (value("SNSR_DUSTBIN_IS_IN", v)) {
+              bool in = v == "1";
+              if (!id(bac_en_place).has_state() || id(bac_en_place).state != in) id(bac_en_place).publish_state(in);
+            }
+            else if (id(pending) == 8 && line.find(',') != std::string::npos) {
+              static const char *keys[] = {"LSIDEBIT", "LFRONTBIT", "RSIDEBIT", "RFRONTBIT", "LLDSBIT", "RLDSBIT",
+                                           "SNSR_LEFT_WHEEL_EXTENDED", "SNSR_RIGHT_WHEEL_EXTENDED"};
+              for (int i = 0; i < 8; i++) {
+                if (value(keys[i], v)) {
+                  if (v == "1") id(digital) |= (1 << i);
+                  else id(digital) &= ~(1 << i);
+                  break;
+                }
+              }
+            }
+            else if (value("CumulativeCleaningTimeInSecs", v)) id(heures_nettoyage).publish_state(strtoul(v.c_str(), nullptr, 16) / 3600.0);
+            else if (id(pending) == 2 && !line.empty() && isdigit((unsigned char) line[0])) {
+              id(erreur).publish_state(line);
+              id(err_seen) = true;
+            }
+          }
+          if (id(robot_booted)) {
+            id(robot_booted) = false;
+            id(after_robot_boot).execute();
+          }
+  - interval: 1s
+    then:
+      - lambda: |-
+          if (!id(drive_req) && !id(refresh_all).is_running()) id(refresh_all).execute();
+  - interval: 100ms
+    then:
+      - lambda: |-
+          if (id(driving) && !id(drive_tick).is_running()) id(drive_tick).execute();
